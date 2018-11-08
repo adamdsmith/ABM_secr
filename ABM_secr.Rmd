@@ -269,10 +269,6 @@ hasABM <- filter(traps_fin, !Session %in% noABM)
 
 # Confirm all traps in capture data are in the trap data
 all(abm$Trap %in% hasABM$Trap)
-
-# Which Session/Grids have false sets? These will need a binary indicator matrix down the road
-falseSets <- traps_fin[traps_fin$Unavailable=="TRUE",]
-unique(falseSets$SessionGrid)
 ```
 
 \newpage
@@ -336,7 +332,11 @@ traps <- lapply(sg_traps, function(i) {
 })
 
 # Create false set indicator
-trap_avail <- lapply(sg_traps, function(i) with(i, table(Trap, Date)))
+trap_avail <- lapply(sg_traps, function(i) {
+  # Drop false sets
+  tmp <- filter(i, !Unavailable)
+  with(tmp, table(Trap, Date))
+})
 ```
 
 ```{r secr_capture_histories, include=FALSE}
@@ -352,109 +352,6 @@ abm_ch <- lapply(names(sg_caps), function(sg) {
 })
 # Restore names since we cycled through list differently
 names(abm_ch) <- names(sg_caps)
-
-# Account for individuals that were translocated/died and thus removed from population. 
-# In secr, we can do this by providing a negative value in their capture history, 
-# on the occasion they were removed from the population.
-Removed <- abm[abm$Removed=="TRUE",]
-
-rownames(ch[[10]])
-for(j in 1:ncol(ch[[10]])){
-  for(k in 1:dim(ch[[10]])[3]){
-if(ch[[10]][19,j,k]==1)
-  ch[[10]][19,j,k]<- -1
-  }}
-
-rownames(ch[[12]])
-for(j in 1:ncol(ch[[12]])){
-  for(k in 1:dim(ch[[12]])[3]){
-if(ch[[12]][19,j,k]==1)
-  ch[[12]][19,j,k]<- -1
-  }}
-
-rownames(ch[[27]])
-for(j in 1:ncol(ch[[27]])){
-  for(k in 1:dim(ch[[27]])[3]){
-if(ch[[27]][40,j,k]==1)
-  ch[[27]][40,j,k]<- -1
-if(ch[[27]][34,j,k]==1)
-  ch[[27]][34,j,k]<- -1
-  }}
-
-rownames(ch[[28]])
-for(j in 1:ncol(ch[[28]])){
-  for(k in 1:dim(ch[[28]])[3]){
-if(ch[[28]][c(44),j,k]==1)
-  ch[[28]][c(44),j,k]<- -1 
-if(ch[[28]][c(18),j,k]==1)
-  ch[[28]][c(18),j,k]<- -1 
-if(ch[[28]][c(42),j,k]==1)
-  ch[[28]][c(42),j,k]<- -1 
-if(ch[[28]][c(49),j,k]==1)
-  ch[[28]][c(49),j,k]<- -1 
-if(ch[[28]][c(1),j,k]==1)
-  ch[[28]][c(1),j,k]<- -1 
-if(ch[[28]][c(53),j,k]==1)
-  ch[[28]][c(53),j,k]<- -1 
-}}
-
-rownames(ch[[29]])
-for(j in 1:ncol(ch[[29]])){
-  for(k in 1:dim(ch[[29]])[3]){
-if(ch[[29]][91,j,k]==1)
-  ch[[29]][91,j,k]<- -1
-if(ch[[29]][49,j,k]==1)
-  ch[[29]][49,j,k]<- -1
-if(ch[[29]][48,j,k]==1)
-  ch[[29]][48,j,k]<- -1
-if(ch[[29]][27,j,k]==1)
-  ch[[29]][27,j,k]<- -1
-if(ch[[29]][108,j,k]==1)
-  ch[[29]][108,j,k]<- -1
-if(ch[[29]][80,j,k]==1)
-  ch[[29]][80,j,k]<- -1
-if(ch[[29]][74,j,k]==1)
-  ch[[29]][74,j,k]<- -1
-if(ch[[29]][65,j,k]==1)
-  ch[[29]][65,j,k]<- -1
-if(ch[[29]][90,j,k]==1)
-  ch[[29]][90,j,k]<- -1
-if(ch[[29]][75,j,k]==1)
-  ch[[29]][75,j,k]<- -1
-if(ch[[29]][72,j,k]==1)
-  ch[[29]][72,j,k]<- -1
-if(ch[[29]][107,j,k]==1)
-  ch[[29]][107,j,k]<- -1
-if(ch[[29]][107,j,k]==1)
-  ch[[29]][107,j,k]<- -1
-  }}
-
-rownames(ch[[35]])
-for(j in 1:ncol(ch[[35]])){
-  for(k in 1:dim(ch[[35]])[3]){
-if(ch[[35]][45,j,k]==1)
-  ch[[35]][45,j,k]<- -1}}
-
-rownames(ch[[34]])
-for(j in 1:ncol(ch[[34]])){
-  for(k in 1:dim(ch[[34]])[3]){
-if(ch[[34]][21,j,k]==1)
-  ch[[34]][21,j,k]<- -1}}
-
-rownames(ch[[60]])
-for(j in 1:ncol(ch[[60]])){
-  for(k in 1:dim(ch[[60]])[3]){
-if(ch[[60]][16,j,k]==1)
-  ch[[60]][16,j,k]<- -1
-if(ch[[60]][18,j,k]==1)
-  ch[[60]][18,j,k]<- -1}}
-
-rownames(ch[[58]])
-for(j in 1:ncol(ch[[58]])){
-  for(k in 1:dim(ch[[58]])[3]){
-if(ch[[58]][5,j,k]==1)
-  ch[[58]][5,j,k]<- -1}}
-
 ```
 
 ```{r fit simple models in secr, include=FALSE, eval=FALSE}
