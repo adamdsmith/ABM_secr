@@ -1,0 +1,1027 @@
+---
+title: "Alabama Beach Mouse report to U.S. Fish and Wildlife Service"
+header-includes:
+  - \usepackage{pdflscape}
+  - \newcommand{\bl}{\begin{landscape}}
+  - \newcommand{\el}{\end{landscape}}
+fontsize: 12pt
+author: "Paige E. Howell and Adam D. Smith"
+output: pdf_document
+bibliography: abm.bib
+---
+
+```{r defaults, echo = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  message = FALSE)
+```
+
+```{r setup}
+# Load (and potentially install) required packages
+if (!requireNamespace("pacman", quietly = TRUE)) install.packages("pacman")
+if (!requireNamespace("nrsmisc", quietly = TRUE)) {
+  if (!requireNamespace("devtools", quietly = TRUE))
+    install.packages("devtools")
+  devtools::install_github("adamdsmith/nrsmisc")
+}
+# Need developement dplyr until 0.8.0 is released
+# If prompted, install any/all updated dependencies
+if (compareVersion("0.7.99.9000", as.character(packageVersion("dplyr"))) > 0)
+  devtools::install_github("tidyverse/dplyr")
+pacman::p_load(nrsmisc, janitor, lubridate, dplyr, tidyr, sf, leaflet, maptools, 
+               htmlwidgets, knitr, kableExtra, secr)
+
+ABM_db <- "./Data/ABM_UGA_data.accdb"
+```
+
+```{r trap_data}
+# Read in trap locations, expand by effort, and reduce by closures
+traps <- read_access(ABM_db, "Grids_Current_Post2017Edit") %>%
+  select(Grid = "Grid ID", Row, Line, UTMN, UTME, 
+         CoverPerc = "% Cover", Habitat)
+
+trap_effort <- read_access(ABM_db, "ABM Trapping Effort Dates") %>%
+  mutate(Date = as.character(Date)) %>%
+  select(Grid = "Grid ID", Date)
+
+closures <- read_access(ABM_db, "ABM Station Closures") %>%
+  mutate(Date = as.character(Date)) %>%
+  select(Grid = "Grid ID", Row, Line, Date, Reason = "Closure Reason")
+saveRDS(closures, file = "Output/closures.rds")
+
+traps_fin <- left_join(traps, trap_effort, by = "Grid") %>%
+  # Drop traps that were closed for various reasons
+  anti_join(closures, by = c("Date", "Grid", "Row", "Line")) %>%
+  arrange(Date, Grid, Row, Line)
+```
+
+```{r map_traps, eval = FALSE}
+# This was used primarily for QA/QC of Grid names and trap locations
+trap_pts <- traps %>%
+  select(Grid, Row, Line, UTMN, UTME) %>%
+  unique() %>%
+  sf::st_as_sf(coords = c("UTME", "UTMN"),
+                   crs = 26916) %>%
+  sf::st_transform(4326)
+
+p <- leaflet() %>%
+  # Base map groups
+  addProviderTiles("Esri.WorldImagery",
+                   options = tileOptions(minZoom=3, maxNativeZoom=19,
+                                         maxZoom=22))
+
+trap_grids <- unique(traps$Grid)
+
+for (t in trap_grids) {
+  tmp <- filter(trap_pts, Grid == t)
+  p <- p %>%
+    addCircles(data = tmp, radius = 5, color = "red",
+               fillOpacity = 0,
+               label = ~paste0("Row ", Row, ", Line ", Line),
+               labelOptions = lapply(1:nrow(tmp), function(x) {
+                 labelOptions(noHide = T)}),
+               group = t) %>%
+    hideGroup(t)
+}
+
+p <- p %>%
+  addLayersControl(overlayGroups = trap_grids,
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  addScaleBar(position = "bottomright")
+htmlwidgets::saveWidget(p, "ABM_trap_locations.html")
+p
+```
+
+```{r meteorology}
+# Retrieve meteorological data from nearby Dauphin Island Buoy (DPIA1)
+# Specifically, we note temperature and wind info (and RH, if available) at top of hour
+# following sunset
+sunset <- get_sun(-87.84459, 30.23513, start = "2004-02-01", 
+                  end = "2017-04-01", direction = "sunset", 
+                  out_tz = "America/Chicago")
+# wx <- get_buoy_wx("DPIA1", years = 2004:2017, out_tz = "America/Chicago")
+# sunset_hour <- sunset %>%
+#   mutate(hour = hour(ceiling_date(sunset, unit = "hours"))) %>%
+#   select(date_str, hour)
+trap_nights <- unique(trap_effort$Date)
+# wx <- left_join(sunset_hour, wx, by = c("date_str", "hour")) %>%
+#   filter(date_str %in% trap_nights)
+# # Add missing temperature data using nearby Fort Morgan Buoy
+# # http://www.ndbc.noaa.gov/station_page.php?station=fmoa1
+# missing <- wx$date[which(is.na(wx$tmp_c))]
+# miss_sset_hr <- filter(sunset_hour, date_str %in% missing)
+# miss_wx <- get_buoy_wx("FMOA1", years = 2012, out_tz = "America/Chicago") %>%
+#   left_join(miss_sset_hr, ., by = c("date_str", "hour")) %>%
+#   group_by(date_str) %>% slice() %>%
+#   filter(row_number() == 1) %>%
+#   ungroup()
+# wx <- filter(wx, !is.na(tmp_c)) %>%
+#   bind_rows(miss_wx) %>%
+#   arrange(datetime)
+# saveRDS(wx, file = "./Output/wx.rds")
+wx <- readRDS(file = "./Output/wx.rds")
+
+# Average moon exposure (illumination and availability; i.e., ambient light)
+# during the first 6 hours after sunset
+# Values from 0 (new moon or moon not risen) to 6 (full moon) for all 6 hrs
+moon <- sunset %>%
+  filter(date_str %in% trap_nights) %>%
+  mutate(moon_illum = get_moon(sunset, -87.84459, 30.23513))
+```
+
+```{r abm_data}
+abm <- read_access(ABM_db, "ABM trapping data") %>%
+  mutate(Remarks = tolower(Remarks),
+         Date = as.character(Date),
+         Removed = as.logical(Removed),
+         Untagged = as.logical(Untagged),
+         Lost_tag = as.logical(`Lost tag`),
+         Escape = as.logical(Escape),
+         Omit = as.logical(Omit),
+         Unavailable = as.logical(`Trap unavailable`)) %>%
+  select(Grid = "Grid ID", Row, Line, Date,
+         Species, Mouse = "Mouse#", Sex, Age, RC, Wt = "Weight (Pesola)",
+         Tail, Removed, Untagged, Lost_tag, Escape, Omit, Unavailable, Remarks)
+
+# Unavailable traps (i.e., both traps tripped by non-target species) are recorded with mouse data
+# Update trap data here with this information
+unavailable <- filter(abm, Unavailable) %>%
+  select(Grid, Row, Line, Date, Unavailable) %>%
+  unique()
+
+make_2_digits<-function(x) as.character(sprintf("%02.0f",x))
+
+# Finalize trap data
+traps_fin <- left_join(traps_fin, unavailable,
+                       by = c("Grid", "Row", "Line", "Date")) %>%
+  replace_na(list(Unavailable = FALSE)) %>%
+  # Add Year, Month, Season, Session, and Session/Grid to trap data
+  mutate(Year = year(Date),
+         Month = month(Date),
+         Season = factor(ifelse(Month < 7, "SP", "FA"), levels = c("SP", "FA")),
+         Session = paste0(Season, Year),
+         SessionGrid = paste(Session, Grid, sep = "-"),
+         Trap = paste(Grid, Row, make_2_digits(Line), sep="-")) %>%
+  group_by(Grid, Session) %>%
+  mutate(Occasion = as.integer(factor(Date))) %>%
+  ungroup()
+
+# Convert session to factor while preserving chronology
+session_levels <- select(traps_fin, Season, Year) %>%
+  unique() %>%
+  arrange(Year, Season) %>%
+  mutate(Session = paste0(Season, Year)) %>%
+  pull(Session)
+traps_fin$Session <- factor(traps_fin$Session, levels = session_levels)
+
+saveRDS(traps_fin, file = "Output/traps_fin.rds")
+```
+
+```{r data_consolidation}
+abm <- filter(abm, Species == "ABM")
+abm <- traps_fin %>%
+  left_join(select(abm, -Species, -Unavailable, -Tail),
+            by = c("Grid", "Row", "Line", "Date")) %>%
+  left_join(select(wx, Date = date_str, wdir, wspd_ms, tmp_c, rh),
+            by = "Date") %>%
+  left_join(select(moon, -sunset), 
+            by = c("Date" = "date_str"))
+saveRDS(abm, file = "./Output/abm_final.rds")
+```
+
+## Data processing - capture histories and trapping grids
+\pagenumbering{gobble}
+
+We removed captures from the dataset when we could not determine an individual's unique individual identification number. This occurred for several reasons: animals escaped or died before tagging or the tag was not read or animals were only observed near a grid but never captured. Consequently, our estimated capture probability is the probability of capturing animals that we didn't let go before tagging or reading the tag.
+
+Tag numbers were sometimes re-used, so mice with the same tag number but caught on different grids or on the same grid, but more than two years apart were treated as different individuals. Some individuals were suspected of being tagged (e.g., ear tear) but no tag was present, and so a new tag was provided. 
+
+Different subsets of grids were operated during each year and season (Table 1). Because we analyzed data separately for each unique Grid, we treated these as new individuals on their first capture occasion, and recaptures thereafter. We also removed grid/year/season combinations where no individuals were captured on any trapping occasion. 
+
+## Spatially-explicit capture mark recapture
+
+We used program *secr* [@efford2018] to estimate density (mice/hectare) for each unique Grid separately. We assumed that density varied by Year/Season (hereafter referred to as Session) within the same grid. 
+
+$$N \sim~ \mathrm{Poisson}(\mu\; \mathrm{x}\; A(S)) $$
+
+$$ \textbf{s}_i \sim \mathrm{Uniform}(S) $$
+
+Here $\mu$ corresponds to density within the study area *S*, and *A(S)* corresponds to the area of the state space. Individual activity centers $\textbf{s}_i$ are uniformly distributed within the state space *S*.
+
+In *secr*, the user can define the width of a buffer around the trapping grids to restrict the area of integration within which the unknown activity centers are numerically integrated out of the likelihood. The buffer should be large enough that the bias in estimated densities is small. For grids with variable sampling effort (e.g., false sets) the default buffer checks are not allowed. For these grids, we used the *esa.plot* function to visually inspect the relationship between estimated density and increasing buffer width. We chose a buffer width at which the estimated density no longer decreased.
+
+We specified a half-normal detection function, where $g_0$ is the baseline capture probability and $\sigma$ determines how quickly capture probability declines as the distance between an animal's activity center *i* and a trap *j* increases. In our analysis, we allowed $g_0$ and $\sigma$ to be shared among Sessions for grids that were sampled multiple times.
+
+$$ p_{ij} = g_0exp(-d^2_{ij}/(2\sigma^2))$$
+Our capture histories (y=1 if individual *i* was captured in trap *j*, on occasion *k* and 0 otherwise) were then modelled as coming from a Bernoulli distribution, where capture probability *p* did not vary over time:
+
+$$ y_{i,j,k} \sim~ \mathrm{Bernoulli}(p_{i,j})$$
+
+On some occasions, traps were occupied by non-target species or were found closed, but with no animal inside (e.g., false set). For trapping grids where false-sets occurred, we coded these captures as a zero and supplied a usage matrix to our capture history data. Some animals were captured, but then removed from the study area for a translocation project or died after their tag number was recorded. For these animals, we recorded a negative value for their capture history, on the occasion they were removed from the population.   
+
+Each trap station consisted of two side-by-side traps, so catching multiple mice within the same trap station on the same occasion was not uncommon. Mice also may forage together and so on some occasions, multiple mice may even be found within the same trap. Therefore we specified the detector type 'multi' to allow for these situations where multiple individuals could be found in the same trap on a single occasion. 
+
+There were some instances where mice were captured in two different traps within the same grid on the same trapping occasion. This is possible because traps were checked multiple times per occassion. For these individuals, we allowed *secr* to randomly select a single trap location within an occasion. (OR MODEL AS CAMERA TRAP "PROXIMITY" TYPE?)
+
+```{r process_captures, include=FALSE}
+# Load capture data data
+abm <- readRDS(file = "Output/abm_final.rds") %>%
+  filter(!is.na(Removed))
+
+# Load trap data 
+traps_fin <- readRDS("Output/traps_fin.rds")
+
+# Drop animals that:
+abm <- filter(abm,
+              # escaped before being tagged or
+              (!Escape & !Untagged) |
+              # escaped before tag read and any others that
+                (!Escape & Untagged) &
+              # have uncertain ID b/c tag was apparently misread (or other uncertainty)
+                !Omit) %>%
+  # Recode animals removed (died, translocated) with negative occasion number as required by secr
+  mutate(Occasion = ifelse(Removed, -1 * Occasion, Occasion))
+
+# Subsets of potential interest; not used for anything in particular
+# When a capture occurred, how many ABM per station?
+abm %>% group_by(Session, Trap, Date) %>% 
+  tally() %>% pull(n) %>% table()
+# Number of times a mouse was captured in a single night
+abm %>% group_by(SessionGrid, Mouse, Date) %>% 
+  tally() %>% pull(n) %>% table()
+```
+
+```{r compare_cap_and_trap, include = FALSE}
+# Generate table of trapping operation schedule
+effort_tab <- select(traps_fin, Grid, Session) %>% 
+  unique() %>% table()
+
+# Are Sessions the same between the capture data and the trap data?
+trapSessUnique <- pull(traps_fin, SessionGrid) %>% unique() #71 unique records
+capSessUnique <- pull(abm, SessionGrid) %>% unique() #65 unique records
+
+# Sessions with no captured ABM
+(noABM <- setdiff(trapSessUnique, capSessUnique))
+
+# Reduce trap data to only those with ABM captures
+hasABM <- filter(traps_fin, !Session %in% noABM)
+
+# Confirm all traps in capture data are in the trap data
+all(abm$Trap %in% hasABM$Trap)
+
+# Which Session/Grids have false sets? These will need a binary indicator matrix down the road
+falseSets <- traps_fin[traps_fin$Unavailable=="TRUE",]
+unique(falseSets$SessionGrid)
+```
+
+\newpage
+\bl
+```{r Table1_trap_effort_summary, echo=FALSE}
+kable(effort_tab, caption = "Summary of when grids were operational (1) or not (0) during the collection of capture-mark-recapture data for the Alabama beach mouse. SP = Spring, FA = Fall", booktab=T) %>%
+  kable_styling(font_size=8.5) %>%
+  column_spec(column=1:25, width="1em")  
+```
+\el
+
+```{r SCR_data_summary, include=FALSE}
+# Format capture history with each row as a mouse
+abm_ch <- with(abm, table(Mouse, Trap, Date))
+
+# Number of captures 
+(ncaps <- sum(abm_ch))
+
+# Number of unique individuals
+# Assumes mice with same ID in different Sessions are different individuals
+(ninds <- select(abm, Session, Mouse) %>% unique() %>% nrow())
+
+#capture frequencies
+table(rowSums(abm_ch))
+#   1   2   3   4   5   6   7   8   9  10  11  12 
+# 587 343 269 173 111  60  32  24   6   5   4   1 
+
+#Create summary table of captures and capture frequencies by session
+cf_summary <- abm %>% count(Session, Mouse) %>%
+  count(Session, n) %>%
+  spread(n, nn, fill = 0) %>%
+  janitor::adorn_totals(c("row", "col"))
+```
+
+```{r format_caps_secr, include=FALSE}
+sg_caps <- split(abm, abm$SessionGrid)
+
+# Pull only the columns needed for `secr`: Session, Mouse, Occasion, Trap
+sg_caps <- lapply(sg_caps, function(i) {
+  select(i, Session, Mouse, Occasion, Trap)
+  })
+```
+
+```{r format_traps_secr, include=FALSE}
+sg_traps <- split(traps_fin, traps_fin$SessionGrid)
+
+# Confirm that several sessions/grid combos had no captures
+noABM2 <- names(sg_traps)[!names(sg_traps) %in% names(sg_caps)]
+identical(sort(noABM), sort(noABM2))
+
+# Drop these SessionGrids with no captures and ensure order of 
+# SessionGrids in capture and trap data...
+sg_traps <- sg_traps[names(sg_caps)]
+
+# Format via secr
+traps <- lapply(sg_traps, function(i) {
+  tmp <- select(i, Detector = Trap, x = UTME, y = UTMN) %>%
+    distinct() %>% as.data.frame()
+  rownames(tmp) <- tmp$Detector
+  read.traps(data = tmp, detector="multi")
+})
+
+# Create false set indicator
+trap_avail <- lapply(sg_traps, function(i) with(i, table(Trap, Date)))
+```
+
+```{r secr_capture_histories, include=FALSE}
+#Create capture history in secr format
+abm_ch <- lapply(names(sg_caps), function(sg) {
+  # Generate CH
+  ch <- make.capthist(captures = as.data.frame(sg_caps[[sg]]), # secr doesn't play nice with tibbles
+                traps = traps[[sg]], fmt = "trapID", 
+                noccasions = max(sg_traps[[sg]]$Occasion))
+  # Set usage (effort) on those traps
+  usage(traps(ch)) <- trap_avail[[sg]]
+  ch
+})
+# Restore names since we cycled through list differently
+names(abm_ch) <- names(sg_caps)
+
+# Account for individuals that were translocated/died and thus removed from population. 
+# In secr, we can do this by providing a negative value in their capture history, 
+# on the occasion they were removed from the population.
+Removed <- abm[abm$Removed=="TRUE",]
+
+rownames(ch[[10]])
+for(j in 1:ncol(ch[[10]])){
+  for(k in 1:dim(ch[[10]])[3]){
+if(ch[[10]][19,j,k]==1)
+  ch[[10]][19,j,k]<- -1
+  }}
+
+rownames(ch[[12]])
+for(j in 1:ncol(ch[[12]])){
+  for(k in 1:dim(ch[[12]])[3]){
+if(ch[[12]][19,j,k]==1)
+  ch[[12]][19,j,k]<- -1
+  }}
+
+rownames(ch[[27]])
+for(j in 1:ncol(ch[[27]])){
+  for(k in 1:dim(ch[[27]])[3]){
+if(ch[[27]][40,j,k]==1)
+  ch[[27]][40,j,k]<- -1
+if(ch[[27]][34,j,k]==1)
+  ch[[27]][34,j,k]<- -1
+  }}
+
+rownames(ch[[28]])
+for(j in 1:ncol(ch[[28]])){
+  for(k in 1:dim(ch[[28]])[3]){
+if(ch[[28]][c(44),j,k]==1)
+  ch[[28]][c(44),j,k]<- -1 
+if(ch[[28]][c(18),j,k]==1)
+  ch[[28]][c(18),j,k]<- -1 
+if(ch[[28]][c(42),j,k]==1)
+  ch[[28]][c(42),j,k]<- -1 
+if(ch[[28]][c(49),j,k]==1)
+  ch[[28]][c(49),j,k]<- -1 
+if(ch[[28]][c(1),j,k]==1)
+  ch[[28]][c(1),j,k]<- -1 
+if(ch[[28]][c(53),j,k]==1)
+  ch[[28]][c(53),j,k]<- -1 
+}}
+
+rownames(ch[[29]])
+for(j in 1:ncol(ch[[29]])){
+  for(k in 1:dim(ch[[29]])[3]){
+if(ch[[29]][91,j,k]==1)
+  ch[[29]][91,j,k]<- -1
+if(ch[[29]][49,j,k]==1)
+  ch[[29]][49,j,k]<- -1
+if(ch[[29]][48,j,k]==1)
+  ch[[29]][48,j,k]<- -1
+if(ch[[29]][27,j,k]==1)
+  ch[[29]][27,j,k]<- -1
+if(ch[[29]][108,j,k]==1)
+  ch[[29]][108,j,k]<- -1
+if(ch[[29]][80,j,k]==1)
+  ch[[29]][80,j,k]<- -1
+if(ch[[29]][74,j,k]==1)
+  ch[[29]][74,j,k]<- -1
+if(ch[[29]][65,j,k]==1)
+  ch[[29]][65,j,k]<- -1
+if(ch[[29]][90,j,k]==1)
+  ch[[29]][90,j,k]<- -1
+if(ch[[29]][75,j,k]==1)
+  ch[[29]][75,j,k]<- -1
+if(ch[[29]][72,j,k]==1)
+  ch[[29]][72,j,k]<- -1
+if(ch[[29]][107,j,k]==1)
+  ch[[29]][107,j,k]<- -1
+if(ch[[29]][107,j,k]==1)
+  ch[[29]][107,j,k]<- -1
+  }}
+
+rownames(ch[[35]])
+for(j in 1:ncol(ch[[35]])){
+  for(k in 1:dim(ch[[35]])[3]){
+if(ch[[35]][45,j,k]==1)
+  ch[[35]][45,j,k]<- -1}}
+
+rownames(ch[[34]])
+for(j in 1:ncol(ch[[34]])){
+  for(k in 1:dim(ch[[34]])[3]){
+if(ch[[34]][21,j,k]==1)
+  ch[[34]][21,j,k]<- -1}}
+
+rownames(ch[[60]])
+for(j in 1:ncol(ch[[60]])){
+  for(k in 1:dim(ch[[60]])[3]){
+if(ch[[60]][16,j,k]==1)
+  ch[[60]][16,j,k]<- -1
+if(ch[[60]][18,j,k]==1)
+  ch[[60]][18,j,k]<- -1}}
+
+rownames(ch[[58]])
+for(j in 1:ncol(ch[[58]])){
+  for(k in 1:dim(ch[[58]])[3]){
+if(ch[[58]][5,j,k]==1)
+  ch[[58]][5,j,k]<- -1}}
+
+```
+
+```{r fit simple models in secr, include=FALSE, eval=FALSE}
+#Buffer should be wide enough not to cause bias in estimated densities
+#Secr includes a buffer bias check when fitting models that shows a warning if the predicted relative bias exceeds 0.01
+#Checked detection probability vs. buffer width for grids where the bias check failed (b/c of variable effort matrix)
+
+# Traps belong to a larger study area
+# Fort Morgan (FT or FTM), Perdue Scrub (PS), and Perdue Dunes (PD, Gazeo, MobileStW)
+
+## Analysis - Analyze each Grid separately, with Session (Year/Season) as the Session
+## Grids without any captures not included in analysis
+
+## O&7FM_OLD
+O_7FM_OLD<-ch[[38]] # Only captures in one trapping session
+O_7FM_OLDfm<-secr.fit(capthist=O_7FM_OLD, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(O_7FM_OLDfm)
+
+## 10&27PD_OLD
+PD_OLD10_27<-MS.capthist(ch[[41]], ch[[44]])
+PD_OLD10_27fm<-secr.fit(capthist=PD_OLD10_27, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) #At least 1 variance calculation failed (little data both seasons)
+summary(PD_OLD10_27)
+
+## 10FM
+FM10<-MS.capthist(ch[[61]], ch[[63]])
+FM10fm<-secr.fit(capthist=FM10, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(FM10fm)
+
+## 11PD
+PD11<-MS.capthist(ch[[62]], ch[[64]])
+PD11fm<-secr.fit(capthist=PD11, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PD11fm)
+
+## 11PS_OLD
+PS_OLD11<-MS.capthist(ch[[42]], ch[[45]])
+PS_OLD11fm<-secr.fit(capthist=PS_OLD11, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PS_OLD11fm)
+
+## 12PD_OLD
+PS_OLD12<-MS.capthist(ch[[27]], ch[[30]], ch[[33]])
+PS_OLD12fm<-secr.fit(capthist=PS_OLD12, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PS_OLD12fm)
+
+## 15_PS
+PS15<-ch[[48]] # Only captures in one trapping session
+PS15fm<-secr.fit(capthist=PS15, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(PS15fm)
+
+## 1FM
+FM1<-ch[[49]] # Only captures in one trapping session
+FM1fm<-secr.fit(capthist=FM1, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(FM1fm)
+
+## 23PD
+PD23<-MS.capthist(ch[[56]], ch[[58]])
+PD23fm<-secr.fit(capthist=PD23, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PD23fm)
+
+## 2PS
+PS2<-ch[[53]] # Only captures in one trapping session
+PS2fm<-secr.fit(capthist=PS2, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(PS2fm)
+
+## 37PD_OLD
+PD_OLD37<-MS.capthist(ch[[28]], ch[[31]], ch[[34]])
+PD_OLD37fm<-secr.fit(capthist=PD_OLD37, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PD_OLD37fm)
+
+## 3PS
+PS3<-ch[[65]] # Only captures in one trapping session
+PS3fm<-secr.fit(capthist=PS3, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(PS3fm)
+
+## 3PS_OLD
+PS_OLD3<-MS.capthist(ch[[36]], ch[[39]])
+PS_OLD3fm<-secr.fit(capthist=PS_OLD3, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PS_OLD3fm)
+
+## 41PD_OLD
+PD_OLD41<-MS.capthist(ch[[37]], ch[[40]])
+PD_OLD41fm<-secr.fit(capthist=PD_OLD41, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PD_OLD41fm)
+
+## 6FM
+FM6<-MS.capthist(ch[[51]], ch[[54]])
+FM6fm<-secr.fit(capthist=FM6, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(FM6fm)
+
+## 6PD
+PD6<-MS.capthist(ch[[47]], ch[[50]])
+PD6fm<-secr.fit(capthist=PD6, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PD6fm)
+
+## 8PS
+PS8<-ch[[59]] # Only captures in one trapping session
+PS8fm<-secr.fit(capthist=PS8, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(PS8fm)
+
+## 9FM
+FM9<-MS.capthist(ch[[57]], ch[[60]])
+FM9fm<-secr.fit(capthist=FM9, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(FM9fm)
+
+## 9PD
+PD9<-MS.capthist(ch[[52]], ch[[59]])
+PD9fm<-secr.fit(capthist=PD9, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PD9fm)
+
+## FA12SP13FM
+FA12SP13FM<-MS.capthist(ch[[43]], ch[[46]])
+FA12SP13FMfm<-secr.fit(capthist=FA12SP13FM, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(FA12SP13FMfm)
+
+## FtME
+FtME<-ch[[1]]
+FtMEfm<-secr.fit(capthist=FtME, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(FtMEfm)
+
+#FtMNPI
+FtMNPI<-MS.capthist(ch[[5]], ch[[8]], ch[[11]], ch[[13]])
+FtMNPIfm<-secr.fit(capthist=FtMNPI, model=list(D~session, g0~1, sigma~1), buffer=1000, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(FtMNPIfm)
+
+## FtMW
+FtMW<-ch[[2]]
+FtMWfm<-secr.fit(capthist=FtMW, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(FtMWfm)
+
+## Gazebo
+Gaz1<-ch[[3]]
+Gaz1fm<-secr.fit(capthist=Gaz1, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(Gaz1fm)
+
+## GazeboPostIvan
+GazPI<-MS.capthist(ch[[6]], ch[[9]], ch[[12]], ch[[14]])
+GazPIfm<-secr.fit(capthist=GazPI, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(GazPIfm)
+
+## MobileStW
+MStW<-ch[[4]]
+MStWfm<-secr.fit(capthist=MStW, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+
+## MobileStWPostIvanBCDKL
+MStWPIB<-ch[[7]]
+MStWPIBfm<-secr.fit(capthist=MStWPIB, model=list(D~1, g0~1, sigma~1), buffer=1500, start=list(D=0.001, g0=0.1, sigma=100))
+
+summary(MStWPIB) #Few detections, won't estimate variance correctly
+
+## MobileStWPostIvanDEFKL
+MStWPID<-ch[[15]]
+MStWPIDfm<-secr.fit(capthist=MStWPID, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(MStWPIDfm)
+
+## MobileStWPostIvanHIJKL
+MStWPIH<-ch[[10]]
+MStWPIHfm<-secr.fit(capthist=MStWPIH, model=list(D~1, g0~1, sigma~1), buffer=500, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(MStWPIHfm)
+
+## PerdueDunes2007
+PD07<-ch[[16]]
+PD07fm<-secr.fit(capthist=PD07, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PD07fm)
+
+## PerdueDunesFa2008
+PDF08<-ch[[20]]
+PDF08fm<-secr.fit(capthist=PDF08, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PDF08fm)
+
+## PerdueDunesSp2008
+PDSp08<-ch[[18]]
+PDSp08fm<-secr.fit(capthist=PDSp08, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PDSp08fm)
+
+## PerdueScrub07
+PS07<-ch[[17]]
+PS07fm<-secr.fit(capthist=PS07, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PS07fm)
+
+## PerdueScrub08
+PS08<-ch[[19]]
+PS08fm<-secr.fit(capthist=PS08, model=list(D~1, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100))
+esa.plot.secr(PS08fm)
+
+## SP09FA09FM
+SP09FA09FM<-MS.capthist(ch[[21]], ch[[24]])
+SP09FA09FMfm<-secr.fit(capthist=SP09FA09FM, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(SP09FA09FMfm)
+
+## SP09FA09PD
+SP09FA09PD<-MS.capthist(ch[[22]], ch[[25]])
+SP09FA09PDfm<-secr.fit(capthist=SP09FA09PD, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(SP09FA09PDfm)
+
+## SP09FA09PS
+SP09FA09PS<-MS.capthist(ch[[23]], ch[[26]])
+SP09FA09PSfm<-secr.fit(capthist=SP09FA09PS, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(SP09FA09PSfm)
+
+## SP10FA10SP11FM
+SP10FA10SP11FM<-MS.capthist(ch[[29]], ch[[32]], ch[[35]])
+SP10FA10SP11FMfm<-secr.fit(capthist=SP10FA10SP11FM, model=list(D~session, g0~1, sigma~1), buffer=300, start=list(D=0.001, g0=0.1, sigma=100)) 
+esa.plot.secr(SP10FA10SP11FMfm)
+
+
+# Put model outputs into a list
+predictions<-NULL
+fms<-NULL
+
+for(i in 1:38){
+  fms<-list(O_7FM_OLDfm, PD_OLD10_27fm, FM10fm, PD11fm, PS_OLD11fm, PS_OLD12fm, PS15fm, FM1fm, PD23fm, PS2fm, PD_OLD37fm, PS3fm, PS_OLD3fm, PD_OLD41fm, FM6fm, PD6fm, PS8fm, FM9fm, PD9fm, FA12SP13FMfm, FtMEfm, FtMNPIfm, FtMWfm, Gaz1fm, GazPIfm, MStWfm, MStWPIBfm, MStWPIDfm, MStWPIHfm, PD07fm, PDF08fm, PDSp08fm, PS07fm, PS08fm, SP09FA09FMfm, SP09FA09PDfm, SP09FA09PSfm, SP10FA10SP11FMfm)
+  predictions[[i]]<-predict(fms[[i]])
+}
+
+save(predictions, file="predictions.gzip")
+
+```
+
+```{r output, include=FALSE}
+load(file="predictions.gzip")
+
+p1<-data.frame(predictions[[1]])
+p2<-data.frame(predictions[[2]][1])
+p3<-data.frame(predictions[[2]][2])
+p4<-data.frame(predictions[[3]][1])
+p5<-data.frame(predictions[[3]][2])
+p6<-data.frame(predictions[[4]][1])
+p7<-data.frame(predictions[[4]][2])
+p8<-data.frame(predictions[[5]][1])
+p9<-data.frame(predictions[[5]][2])
+p10<-data.frame(predictions[[6]][1])
+p11<-data.frame(predictions[[6]][2])
+p12<-data.frame(predictions[[6]][3])
+p13<-data.frame(predictions[[7]])
+p14<-data.frame(predictions[[8]])
+p15<-data.frame(predictions[[9]][1])
+p16<-data.frame(predictions[[9]][2])
+p17<-data.frame(predictions[[10]])
+p18<-data.frame(predictions[[11]][1])
+p19<-data.frame(predictions[[11]][2])
+p20<-data.frame(predictions[[11]][3])
+p21<-data.frame(predictions[[12]])
+p22<-data.frame(predictions[[13]][1])
+p23<-data.frame(predictions[[13]][2])
+p24<-data.frame(predictions[[14]][1])
+p25<-data.frame(predictions[[14]][2])
+p26<-data.frame(predictions[[15]][1])
+p27<-data.frame(predictions[[15]][2])
+p28<-data.frame(predictions[[16]][1])
+p29<-data.frame(predictions[[16]][2])
+p30<-data.frame(predictions[[17]])
+p31<-data.frame(predictions[[18]][1])
+p32<-data.frame(predictions[[18]][2])
+p33<-data.frame(predictions[[19]][1])
+p34<-data.frame(predictions[[19]][2])
+p35<-data.frame(predictions[[20]][1])
+p36<-data.frame(predictions[[20]][2])
+p37<-data.frame(predictions[[21]])
+p38<-data.frame(predictions[[22]][1])
+p39<-data.frame(predictions[[22]][2])
+p40<-data.frame(predictions[[22]][3])
+p41<-data.frame(predictions[[22]][4])
+p42<-data.frame(predictions[[23]])
+p43<-data.frame(predictions[[24]])
+p44<-data.frame(predictions[[25]][1])
+p45<-data.frame(predictions[[25]][2])
+p46<-data.frame(predictions[[25]][3])
+p47<-data.frame(predictions[[25]][4])
+p48<-data.frame(predictions[[26]])
+p49<-data.frame(predictions[[27]])
+p50<-data.frame(predictions[[28]])
+p51<-data.frame(predictions[[29]])
+p52<-data.frame(predictions[[30]])
+p53<-data.frame(predictions[[31]])
+p54<-data.frame(predictions[[32]])
+p55<-data.frame(predictions[[33]])
+p56<-data.frame(predictions[[34]])
+p57<-data.frame(predictions[[35]][1])
+p58<-data.frame(predictions[[35]][2])
+p59<-data.frame(predictions[[36]][1])
+p60<-data.frame(predictions[[36]][2])
+p61<-data.frame(predictions[[37]][1])
+p62<-data.frame(predictions[[37]][2])
+p63<-data.frame(predictions[[38]][1])
+p64<-data.frame(predictions[[38]][2])
+p65<-data.frame(predictions[[38]][3])
+
+
+# Table of density (mice/ha; mean) and 95% CI
+## Density
+d1<-paste(round(p1[1,2], 2), "(", round(p1[1,4], 2), ",", round(p1[1,5], 2), ")", sep="")
+d2<-paste(round(p2[1,2], 2), "(", round(p2[1,4], 2), ",", round(p2[1,5], 2), ")", sep="")
+d3<-paste(round(p3[1,2], 2), "(", round(p3[1,4], 2), ",", round(p3[1,5], 2), ")", sep="")
+d4<-paste(round(p4[1,2], 2), "(", round(p4[1,4], 2), ",", round(p4[1,5], 2), ")", sep="")
+d5<-paste(round(p5[1,2], 2), "(", round(p5[1,4], 2), ",", round(p5[1,5], 2), ")", sep="")
+d6<-paste(round(p6[1,2], 2), "(", round(p6[1,4], 2), ",", round(p6[1,5], 2), ")", sep="")
+d7<-paste(round(p7[1,2], 2), "(", round(p7[1,4], 2), ",", round(p7[1,5], 2), ")", sep="")
+d8<-paste(round(p8[1,2], 2), "(", round(p8[1,4], 2), ",", round(p8[1,5], 2), ")", sep="")
+d9<-paste(round(p9[1,2], 2), "(", round(p9[1,4], 2), ",", round(p9[1,5], 2), ")", sep="")
+d10<-paste(round(p10[1,2], 2), "(", round(p10[1,4], 2), ",", round(p10[1,5], 2), ")", sep="")
+d11<-paste(round(p11[1,2], 2), "(", round(p11[1,4], 2), ",", round(p11[1,5], 2), ")", sep="")
+d12<-paste(round(p12[1,2], 2), "(", round(p12[1,4], 2), ",", round(p12[1,5], 2), ")", sep="")
+d13<-paste(round(p13[1,2], 2), "(", round(p13[1,4], 2), ",", round(p13[1,5], 2), ")", sep="")
+d14<-paste(round(p14[1,2], 2), "(", round(p14[1,4], 2), ",", round(p14[1,5], 2), ")", sep="")
+d15<-paste(round(p15[1,2], 2), "(", round(p15[1,4], 2), ",", round(p15[1,5], 2), ")", sep="")
+d16<-paste(round(p16[1,2], 2), "(", round(p16[1,4], 2), ",", round(p16[1,5], 2), ")", sep="")
+d17<-paste(round(p17[1,2], 2), "(", round(p17[1,4], 2), ",", round(p17[1,5], 2), ")", sep="")
+d18<-paste(round(p18[1,2], 2), "(", round(p18[1,4], 2), ",", round(p18[1,5], 2), ")", sep="")
+d19<-paste(round(p19[1,2], 2), "(", round(p19[1,4], 2), ",", round(p19[1,5], 2), ")", sep="")
+d20<-paste(round(p20[1,2], 2), "(", round(p20[1,4], 2), ",", round(p20[1,5], 2), ")", sep="")
+
+d21<-paste(round(p21[1,2], 2), "(", round(p21[1,4], 2), ",", round(p21[1,5], 2), ")", sep="")
+d22<-paste(round(p22[1,2], 2), "(", round(p22[1,4], 2), ",", round(p22[1,5], 2), ")", sep="")
+d23<-paste(round(p23[1,2], 2), "(", round(p23[1,4], 2), ",", round(p23[1,5], 2), ")", sep="")
+d24<-paste(round(p24[1,2], 2), "(", round(p24[1,4], 2), ",", round(p24[1,5], 2), ")", sep="")
+d25<-paste(round(p25[1,2], 2), "(", round(p25[1,4], 2), ",", round(p25[1,5], 2), ")", sep="")
+d26<-paste(round(p26[1,2], 2), "(", round(p26[1,4], 2), ",", round(p26[1,5], 2), ")", sep="")
+d27<-paste(round(p27[1,2], 2), "(", round(p27[1,4], 2), ",", round(p27[1,5], 2), ")", sep="")
+d28<-paste(round(p28[1,2], 2), "(", round(p28[1,4], 2), ",", round(p28[1,5], 2), ")", sep="")
+d29<-paste(round(p29[1,2], 2), "(", round(p29[1,4], 2), ",", round(p29[1,5], 2), ")", sep="")
+d30<-paste(round(p30[1,2], 2), "(", round(p30[1,4], 2), ",", round(p30[1,5], 2), ")", sep="")
+d31<-paste(round(p31[1,2], 2), "(", round(p31[1,4], 2), ",", round(p31[1,5], 2), ")", sep="")
+d32<-paste(round(p32[1,2], 2), "(", round(p32[1,4], 2), ",", round(p32[1,5], 2), ")", sep="")
+d33<-paste(round(p33[1,2], 2), "(", round(p33[1,4], 2), ",", round(p33[1,5], 2), ")", sep="")
+d34<-paste(round(p34[1,2], 2), "(", round(p34[1,4], 2), ",", round(p34[1,5], 2), ")", sep="")
+d35<-paste(round(p35[1,2], 2), "(", round(p35[1,4], 2), ",", round(p35[1,5], 2), ")", sep="")
+d36<-paste(round(p36[1,2], 2), "(", round(p36[1,4], 2), ",", round(p36[1,5], 2), ")", sep="")
+d37<-paste(round(p37[1,2], 2), "(", round(p37[1,4], 2), ",", round(p37[1,5], 2), ")", sep="")
+d38<-paste(round(p38[1,2], 2), "(", round(p38[1,4], 2), ",", round(p38[1,5], 2), ")", sep="")
+d39<-paste(round(p39[1,2], 2), "(", round(p39[1,4], 2), ",", round(p39[1,5], 2), ")", sep="")
+d40<-paste(round(p40[1,2], 2), "(", round(p40[1,4], 2), ",", round(p40[1,5], 2), ")", sep="")
+
+d41<-paste(round(p41[1,2], 2), "(", round(p41[1,4], 2), ",", round(p41[1,5], 2), ")", sep="")
+d42<-paste(round(p42[1,2], 2), "(", round(p42[1,4], 2), ",", round(p42[1,5], 2), ")", sep="")
+d43<-paste(round(p43[1,2], 2), "(", round(p43[1,4], 2), ",", round(p43[1,5], 2), ")", sep="")
+d44<-paste(round(p44[1,2], 2), "(", round(p44[1,4], 2), ",", round(p44[1,5], 2), ")", sep="")
+d45<-paste(round(p45[1,2], 2), "(", round(p45[1,4], 2), ",", round(p45[1,5], 2), ")", sep="")
+d46<-paste(round(p46[1,2], 2), "(", round(p46[1,4], 2), ",", round(p46[1,5], 2), ")", sep="")
+d47<-paste(round(p47[1,2], 2), "(", round(p47[1,4], 2), ",", round(p47[1,5], 2), ")", sep="")
+d48<-paste(round(p48[1,2], 2), "(", round(p48[1,4], 2), ",", round(p48[1,5], 2), ")", sep="")
+d49<-paste(round(p49[1,2], 2), "(", round(p49[1,4], 2), ",", round(p49[1,5], 2), ")", sep="")
+d50<-paste(round(p50[1,2], 2), "(", round(p50[1,4], 2), ",", round(p50[1,5], 2), ")", sep="")
+d51<-paste(round(p51[1,2], 2), "(", round(p51[1,4], 2), ",", round(p51[1,5], 2), ")", sep="")
+d52<-paste(round(p52[1,2], 2), "(", round(p52[1,4], 2), ",", round(p52[1,5], 2), ")", sep="")
+d53<-paste(round(p53[1,2], 2), "(", round(p53[1,4], 2), ",", round(p53[1,5], 2), ")", sep="")
+d54<-paste(round(p54[1,2], 2), "(", round(p54[1,4], 2), ",", round(p54[1,5], 2), ")", sep="")
+d55<-paste(round(p55[1,2], 2), "(", round(p55[1,4], 2), ",", round(p55[1,5], 2), ")", sep="")
+d56<-paste(round(p56[1,2], 2), "(", round(p56[1,4], 2), ",", round(p56[1,5], 2), ")", sep="")
+d57<-paste(round(p57[1,2], 2), "(", round(p57[1,4], 2), ",", round(p57[1,5], 2), ")", sep="")
+d58<-paste(round(p58[1,2], 2), "(", round(p58[1,4], 2), ",", round(p58[1,5], 2), ")", sep="")
+d59<-paste(round(p59[1,2], 2), "(", round(p59[1,4], 2), ",", round(p59[1,5], 2), ")", sep="")
+d60<-paste(round(p60[1,2], 2), "(", round(p60[1,4], 2), ",", round(p60[1,5], 2), ")", sep="")
+
+d61<-paste(round(p61[1,2], 2), "(", round(p61[1,4], 2), ",", round(p61[1,5], 2), ")", sep="")
+d62<-paste(round(p62[1,2], 2), "(", round(p62[1,4], 2), ",", round(p62[1,5], 2), ")", sep="")
+d63<-paste(round(p63[1,2], 2), "(", round(p63[1,4], 2), ",", round(p63[1,5], 2), ")", sep="")
+d64<-paste(round(p64[1,2], 2), "(", round(p64[1,4], 2), ",", round(p64[1,5], 2), ")", sep="")
+d65<-paste(round(p65[1,2], 2), "(", round(p65[1,4], 2), ",", round(p65[1,5], 2), ")", sep="")
+
+## g0
+g01<-paste(round(p1[2,2], 2), "(", round(p1[2,4], 2), ",", round(p1[2,5], 2), ")", sep="")
+g02<-paste(round(p2[2,2], 2), "(", round(p2[2,4], 2), ",", round(p2[2,5], 2), ")", sep="")
+g03<-paste(round(p3[2,2], 2), "(", round(p3[2,4], 2), ",", round(p3[2,5], 2), ")", sep="")
+g04<-paste(round(p4[2,2], 2), "(", round(p4[2,4], 2), ",", round(p4[2,5], 2), ")", sep="")
+g05<-paste(round(p5[2,2], 2), "(", round(p5[2,4], 2), ",", round(p5[2,5], 2), ")", sep="")
+g06<-paste(round(p6[2,2], 2), "(", round(p6[2,4], 2), ",", round(p6[2,5], 2), ")", sep="")
+g07<-paste(round(p7[2,2], 2), "(", round(p7[2,4], 2), ",", round(p7[2,5], 2), ")", sep="")
+g08<-paste(round(p8[2,2], 2), "(", round(p8[2,4], 2), ",", round(p8[2,5], 2), ")", sep="")
+g09<-paste(round(p9[2,2], 2), "(", round(p9[2,4], 2), ",", round(p9[2,5], 2), ")", sep="")
+g010<-paste(round(p10[2,2], 2), "(", round(p10[2,4], 2), ",", round(p10[2,5], 2), ")", sep="")
+g011<-paste(round(p11[2,2], 2), "(", round(p11[2,4], 2), ",", round(p11[2,5], 2), ")", sep="")
+g012<-paste(round(p12[2,2], 2), "(", round(p12[2,4], 2), ",", round(p12[2,5], 2), ")", sep="")
+g013<-paste(round(p13[2,2], 2), "(", round(p13[2,4], 2), ",", round(p13[2,5], 2), ")", sep="")
+g014<-paste(round(p14[2,2], 2), "(", round(p14[2,4], 2), ",", round(p14[2,5], 2), ")", sep="")
+g015<-paste(round(p15[2,2], 2), "(", round(p15[2,4], 2), ",", round(p15[2,5], 2), ")", sep="")
+g016<-paste(round(p16[2,2], 2), "(", round(p16[2,4], 2), ",", round(p16[2,5], 2), ")", sep="")
+g017<-paste(round(p17[2,2], 2), "(", round(p17[2,4], 2), ",", round(p17[2,5], 2), ")", sep="")
+g018<-paste(round(p18[2,2], 2), "(", round(p18[2,4], 2), ",", round(p18[2,5], 2), ")", sep="")
+g019<-paste(round(p19[2,2], 2), "(", round(p19[2,4], 2), ",", round(p19[2,5], 2), ")", sep="")
+g020<-paste(round(p20[2,2], 2), "(", round(p20[2,4], 2), ",", round(p20[2,5], 2), ")", sep="")
+
+g021<-paste(round(p21[2,2], 2), "(", round(p21[2,4], 2), ",", round(p21[2,5], 2), ")", sep="")
+g022<-paste(round(p22[2,2], 2), "(", round(p22[2,4], 2), ",", round(p22[2,5], 2), ")", sep="")
+g023<-paste(round(p23[2,2], 2), "(", round(p23[2,4], 2), ",", round(p23[2,5], 2), ")", sep="")
+g024<-paste(round(p24[2,2], 2), "(", round(p24[2,4], 2), ",", round(p24[2,5], 2), ")", sep="")
+g025<-paste(round(p25[2,2], 2), "(", round(p25[2,4], 2), ",", round(p25[2,5], 2), ")", sep="")
+g026<-paste(round(p26[2,2], 2), "(", round(p26[2,4], 2), ",", round(p26[2,5], 2), ")", sep="")
+g027<-paste(round(p27[2,2], 2), "(", round(p27[2,4], 2), ",", round(p27[2,5], 2), ")", sep="")
+g028<-paste(round(p28[2,2], 2), "(", round(p28[2,4], 2), ",", round(p28[2,5], 2), ")", sep="")
+g029<-paste(round(p29[2,2], 2), "(", round(p29[2,4], 2), ",", round(p29[2,5], 2), ")", sep="")
+g030<-paste(round(p30[2,2], 2), "(", round(p30[2,4], 2), ",", round(p30[2,5], 2), ")", sep="")
+g031<-paste(round(p31[2,2], 2), "(", round(p31[2,4], 2), ",", round(p31[2,5], 2), ")", sep="")
+g032<-paste(round(p32[2,2], 2), "(", round(p32[2,4], 2), ",", round(p32[2,5], 2), ")", sep="")
+g033<-paste(round(p33[2,2], 2), "(", round(p33[2,4], 2), ",", round(p33[2,5], 2), ")", sep="")
+g034<-paste(round(p34[2,2], 2), "(", round(p34[2,4], 2), ",", round(p34[2,5], 2), ")", sep="")
+g035<-paste(round(p35[2,2], 2), "(", round(p35[2,4], 2), ",", round(p35[2,5], 2), ")", sep="")
+g036<-paste(round(p36[2,2], 2), "(", round(p36[2,4], 2), ",", round(p36[2,5], 2), ")", sep="")
+g037<-paste(round(p37[2,2], 2), "(", round(p37[2,4], 2), ",", round(p37[2,5], 2), ")", sep="")
+g038<-paste(round(p38[2,2], 2), "(", round(p38[2,4], 2), ",", round(p38[2,5], 2), ")", sep="")
+g039<-paste(round(p39[2,2], 2), "(", round(p39[2,4], 2), ",", round(p39[2,5], 2), ")", sep="")
+g040<-paste(round(p40[2,2], 2), "(", round(p40[2,4], 2), ",", round(p40[2,5], 2), ")", sep="")
+
+g041<-paste(round(p41[2,2], 2), "(", round(p41[2,4], 2), ",", round(p41[2,5], 2), ")", sep="")
+g042<-paste(round(p42[2,2], 2), "(", round(p42[2,4], 2), ",", round(p42[2,5], 2), ")", sep="")
+g043<-paste(round(p43[2,2], 2), "(", round(p43[2,4], 2), ",", round(p43[2,5], 2), ")", sep="")
+g044<-paste(round(p44[2,2], 2), "(", round(p44[2,4], 2), ",", round(p44[2,5], 2), ")", sep="")
+g045<-paste(round(p45[2,2], 2), "(", round(p45[2,4], 2), ",", round(p45[2,5], 2), ")", sep="")
+g046<-paste(round(p46[2,2], 2), "(", round(p46[2,4], 2), ",", round(p46[2,5], 2), ")", sep="")
+g047<-paste(round(p47[2,2], 2), "(", round(p47[2,4], 2), ",", round(p47[2,5], 2), ")", sep="")
+g048<-paste(round(p48[2,2], 2), "(", round(p48[2,4], 2), ",", round(p48[2,5], 2), ")", sep="")
+g049<-paste(round(p49[2,2], 2), "(", round(p49[2,4], 2), ",", round(p49[2,5], 2), ")", sep="")
+g050<-paste(round(p50[2,2], 2), "(", round(p50[2,4], 2), ",", round(p50[2,5], 2), ")", sep="")
+g051<-paste(round(p51[2,2], 2), "(", round(p51[2,4], 2), ",", round(p51[2,5], 2), ")", sep="")
+g052<-paste(round(p52[2,2], 2), "(", round(p52[2,4], 2), ",", round(p52[2,5], 2), ")", sep="")
+g053<-paste(round(p53[2,2], 2), "(", round(p53[2,4], 2), ",", round(p53[2,5], 2), ")", sep="")
+g054<-paste(round(p54[2,2], 2), "(", round(p54[2,4], 2), ",", round(p54[2,5], 2), ")", sep="")
+g055<-paste(round(p55[2,2], 2), "(", round(p55[2,4], 2), ",", round(p55[2,5], 2), ")", sep="")
+g056<-paste(round(p56[2,2], 2), "(", round(p56[2,4], 2), ",", round(p56[2,5], 2), ")", sep="")
+g057<-paste(round(p57[2,2], 2), "(", round(p57[2,4], 2), ",", round(p57[2,5], 2), ")", sep="")
+g058<-paste(round(p58[2,2], 2), "(", round(p58[2,4], 2), ",", round(p58[2,5], 2), ")", sep="")
+g059<-paste(round(p59[2,2], 2), "(", round(p59[2,4], 2), ",", round(p59[2,5], 2), ")", sep="")
+g060<-paste(round(p60[2,2], 2), "(", round(p60[2,4], 2), ",", round(p60[2,5], 2), ")", sep="")
+
+g061<-paste(round(p61[2,2], 2), "(", round(p61[2,4], 2), ",", round(p61[2,5], 2), ")", sep="")
+g062<-paste(round(p62[2,2], 2), "(", round(p62[2,4], 2), ",", round(p62[2,5], 2), ")", sep="")
+g063<-paste(round(p63[2,2], 2), "(", round(p63[2,4], 2), ",", round(p63[2,5], 2), ")", sep="")
+g064<-paste(round(p64[2,2], 2), "(", round(p64[2,4], 2), ",", round(p64[2,5], 2), ")", sep="")
+g065<-paste(round(p65[2,2], 2), "(", round(p65[2,4], 2), ",", round(p65[2,5], 2), ")", sep="")
+
+## sigma
+sig1<-paste(round(p1[3,2], 2), "(", round(p1[3,4], 2), ",", round(p1[3,5], 2), ")", sep="")
+sig2<-paste(round(p2[3,2], 2), "(", round(p2[3,4], 2), ",", round(p2[3,5], 2), ")", sep="")
+sig3<-paste(round(p3[3,2], 2), "(", round(p3[3,4], 2), ",", round(p3[3,5], 2), ")", sep="")
+sig4<-paste(round(p4[3,2], 2), "(", round(p4[3,4], 2), ",", round(p4[3,5], 2), ")", sep="")
+sig5<-paste(round(p5[3,2], 2), "(", round(p5[3,4], 2), ",", round(p5[3,5], 2), ")", sep="")
+sig6<-paste(round(p6[3,2], 2), "(", round(p6[3,4], 2), ",", round(p6[3,5], 2), ")", sep="")
+sig7<-paste(round(p7[3,2], 2), "(", round(p7[3,4], 2), ",", round(p7[3,5], 2), ")", sep="")
+sig8<-paste(round(p8[3,2], 2), "(", round(p8[3,4], 2), ",", round(p8[3,5], 2), ")", sep="")
+sig9<-paste(round(p9[3,2], 2), "(", round(p9[3,4], 2), ",", round(p9[3,5], 2), ")", sep="")
+sig10<-paste(round(p10[3,2], 2), "(", round(p10[3,4], 2), ",", round(p10[3,5], 2), ")", sep="")
+sig11<-paste(round(p11[3,2], 2), "(", round(p11[3,4], 2), ",", round(p11[3,5], 2), ")", sep="")
+sig12<-paste(round(p12[3,2], 2), "(", round(p12[3,4], 2), ",", round(p12[3,5], 2), ")", sep="")
+sig13<-paste(round(p13[3,2], 2), "(", round(p13[3,4], 2), ",", round(p13[3,5], 2), ")", sep="")
+sig14<-paste(round(p14[3,2], 2), "(", round(p14[3,4], 2), ",", round(p14[3,5], 2), ")", sep="")
+sig15<-paste(round(p15[3,2], 2), "(", round(p15[3,4], 2), ",", round(p15[3,5], 2), ")", sep="")
+sig16<-paste(round(p16[3,2], 2), "(", round(p16[3,4], 2), ",", round(p16[3,5], 2), ")", sep="")
+sig17<-paste(round(p17[3,2], 2), "(", round(p17[3,4], 2), ",", round(p17[3,5], 2), ")", sep="")
+sig18<-paste(round(p18[3,2], 2), "(", round(p18[3,4], 2), ",", round(p18[3,5], 2), ")", sep="")
+sig19<-paste(round(p19[3,2], 2), "(", round(p19[3,4], 2), ",", round(p19[3,5], 2), ")", sep="")
+sig20<-paste(round(p20[3,2], 2), "(", round(p20[3,4], 2), ",", round(p20[3,5], 2), ")", sep="")
+
+sig21<-paste(round(p21[3,2], 2), "(", round(p21[3,4], 2), ",", round(p21[3,5], 2), ")", sep="")
+sig22<-paste(round(p22[3,2], 2), "(", round(p22[3,4], 2), ",", round(p22[3,5], 2), ")", sep="")
+sig23<-paste(round(p23[3,2], 2), "(", round(p23[3,4], 2), ",", round(p23[3,5], 2), ")", sep="")
+sig24<-paste(round(p24[3,2], 2), "(", round(p24[3,4], 2), ",", round(p24[3,5], 2), ")", sep="")
+sig25<-paste(round(p25[3,2], 2), "(", round(p25[3,4], 2), ",", round(p25[3,5], 2), ")", sep="")
+sig26<-paste(round(p26[3,2], 2), "(", round(p26[3,4], 2), ",", round(p26[3,5], 2), ")", sep="")
+sig27<-paste(round(p27[3,2], 2), "(", round(p27[3,4], 2), ",", round(p27[3,5], 2), ")", sep="")
+sig28<-paste(round(p28[3,2], 2), "(", round(p28[3,4], 2), ",", round(p28[3,5], 2), ")", sep="")
+sig29<-paste(round(p29[3,2], 2), "(", round(p29[3,4], 2), ",", round(p29[3,5], 2), ")", sep="")
+sig30<-paste(round(p30[3,2], 2), "(", round(p30[3,4], 2), ",", round(p30[3,5], 2), ")", sep="")
+sig31<-paste(round(p31[3,2], 2), "(", round(p31[3,4], 2), ",", round(p31[3,5], 2), ")", sep="")
+sig32<-paste(round(p32[3,2], 2), "(", round(p32[3,4], 2), ",", round(p32[3,5], 2), ")", sep="")
+sig33<-paste(round(p33[3,2], 2), "(", round(p33[3,4], 2), ",", round(p33[3,5], 2), ")", sep="")
+sig34<-paste(round(p34[3,2], 2), "(", round(p34[3,4], 2), ",", round(p34[3,5], 2), ")", sep="")
+sig35<-paste(round(p35[3,2], 2), "(", round(p35[3,4], 2), ",", round(p35[3,5], 2), ")", sep="")
+sig36<-paste(round(p36[3,2], 2), "(", round(p36[3,4], 2), ",", round(p36[3,5], 2), ")", sep="")
+sig37<-paste(round(p37[3,2], 2), "(", round(p37[3,4], 2), ",", round(p37[3,5], 2), ")", sep="")
+sig38<-paste(round(p38[3,2], 2), "(", round(p38[3,4], 2), ",", round(p38[3,5], 2), ")", sep="")
+sig39<-paste(round(p39[3,2], 2), "(", round(p39[3,4], 2), ",", round(p39[3,5], 2), ")", sep="")
+sig40<-paste(round(p40[3,2], 2), "(", round(p40[3,4], 2), ",", round(p40[3,5], 2), ")", sep="")
+
+sig41<-paste(round(p41[3,2], 2), "(", round(p41[3,4], 2), ",", round(p41[3,5], 2), ")", sep="")
+sig42<-paste(round(p42[3,2], 2), "(", round(p42[3,4], 2), ",", round(p42[3,5], 2), ")", sep="")
+sig43<-paste(round(p43[3,2], 2), "(", round(p43[3,4], 2), ",", round(p43[3,5], 2), ")", sep="")
+sig44<-paste(round(p44[3,2], 2), "(", round(p44[3,4], 2), ",", round(p44[3,5], 2), ")", sep="")
+sig45<-paste(round(p45[3,2], 2), "(", round(p45[3,4], 2), ",", round(p45[3,5], 2), ")", sep="")
+sig46<-paste(round(p46[3,2], 2), "(", round(p46[3,4], 2), ",", round(p46[3,5], 2), ")", sep="")
+sig47<-paste(round(p47[3,2], 2), "(", round(p47[3,4], 2), ",", round(p47[3,5], 2), ")", sep="")
+sig48<-paste(round(p48[3,2], 2), "(", round(p48[3,4], 2), ",", round(p48[3,5], 2), ")", sep="")
+sig49<-paste(round(p49[3,2], 2), "(", round(p49[3,4], 2), ",", round(p49[3,5], 2), ")", sep="")
+sig50<-paste(round(p50[3,2], 2), "(", round(p50[3,4], 2), ",", round(p50[3,5], 2), ")", sep="")
+sig51<-paste(round(p51[3,2], 2), "(", round(p51[3,4], 2), ",", round(p51[3,5], 2), ")", sep="")
+sig52<-paste(round(p52[3,2], 2), "(", round(p52[3,4], 2), ",", round(p52[3,5], 2), ")", sep="")
+sig53<-paste(round(p53[3,2], 2), "(", round(p53[3,4], 2), ",", round(p53[3,5], 2), ")", sep="")
+sig54<-paste(round(p54[3,2], 2), "(", round(p54[3,4], 2), ",", round(p54[3,5], 2), ")", sep="")
+sig55<-paste(round(p55[3,2], 2), "(", round(p55[3,4], 2), ",", round(p55[3,5], 2), ")", sep="")
+sig56<-paste(round(p56[3,2], 2), "(", round(p56[3,4], 2), ",", round(p56[3,5], 2), ")", sep="")
+sig57<-paste(round(p57[3,2], 2), "(", round(p57[3,4], 2), ",", round(p57[3,5], 2), ")", sep="")
+sig58<-paste(round(p58[3,2], 2), "(", round(p58[3,4], 2), ",", round(p58[3,5], 2), ")", sep="")
+sig59<-paste(round(p59[3,2], 2), "(", round(p59[3,4], 2), ",", round(p59[3,5], 2), ")", sep="")
+sig60<-paste(round(p60[3,2], 2), "(", round(p60[3,4], 2), ",", round(p60[3,5], 2), ")", sep="")
+
+sig61<-paste(round(p61[3,2], 2), "(", round(p61[3,4], 2), ",", round(p61[3,5], 2), ")", sep="")
+sig62<-paste(round(p62[3,2], 2), "(", round(p62[3,4], 2), ",", round(p62[3,5], 2), ")", sep="")
+sig63<-paste(round(p63[3,2], 2), "(", round(p63[3,4], 2), ",", round(p63[3,5], 2), ")", sep="")
+sig64<-paste(round(p64[3,2], 2), "(", round(p64[3,4], 2), ",", round(p64[3,5], 2), ")", sep="")
+sig65<-paste(round(p65[3,2], 2), "(", round(p65[3,4], 2), ",", round(p65[3,5], 2), ")", sep="")
+
+
+# Compile and name
+paste("d", 1:65,",", sep="")
+D<-rbind(d1,  d2,  d3,  d4,  d5,  d6,  d7,  d8,  d9,  d10, d11, d12, d13,
+d14, d15, d16, d17, d18, d19, d20, d21, d22, d23, d24, d25, d26,
+d27, d28, d29, d30, d31, d32, d33, d34, d35, d36, d37, d38, d39,
+d40, d41, d42, d43, d44, d45, d46, d47, d48, d49, d50, d51, d52,
+d53, d54, d55, d56, d57, d58, d59, d60, d61, d62, d63, d64, d65)
+
+g0<-rbind(g01,  g02,  g03,  g04,  g05,  g06,  g07,  g08,  g09,  g010, g011, g012, g013,
+g014, g015, g016, g017, g018, g019, g020, g021, g022, g023, g024, g025, g026,
+g027, g028, g029, g030, g031, g032, g033, g034, g035, g036, g037, g038, g039,
+g040, g041, g042, g043, g044, g045, g046, g047, g048, g049, g050, g051, g052,
+g053, g054, g055, g056, g057, g058, g059, g060, g061, g062, g063, g064, g065)
+
+sig<-rbind(sig1,  sig2,  sig3,  sig4,  sig5,  sig6,  sig7,  sig8,  sig9,  sig10, sig11, sig12, sig13,
+sig14, sig15, sig16, sig17, sig18, sig19, sig20, sig21, sig22, sig23, sig24, sig25, sig26,
+sig27, sig28, sig29, sig30, sig31, sig32, sig33, sig34, sig35, sig36, sig37, sig38, sig39,
+sig40, sig41, sig42, sig43, sig44, sig45, sig46, sig47, sig48, sig49, sig50, sig51, sig52,
+sig53, sig54, sig55, sig56, sig57, sig58, sig59, sig60, sig61, sig62, sig63, sig64, sig65)
+
+grid_unique<-traps_fin7[!duplicated(traps_fin7$SGrid),]
+grids<-grid_unique[order(grid_unique$Grid),]
+Ests<-cbind(grids$Grid, grids$Year, grids$Season, D, g0, sig)
+for(i in 1:nrow(Ests)){
+  if(Ests[i,3]=="aSP")
+    Ests[i,3]<-"SP"
+}
+
+head(Ests)
+rownames(Ests)<-NULL
+colnames(Ests)<-c("Grid", "Year", "Season","Density", "g0", "sigma")
+
+
+write.table(format(Ests, digits=2, justify="right"),
+            quote=FALSE, sep="&", #eol=" \\\\\n",
+            file="Table_ParEst.txt")
+
+#Find the average density, removing the very unreasonable estimates
+#dEst<-Ests[Ests$Density<95, ]
+#mean(dEst[,4], na.rm=TRUE)
+#quantile(dEst[,4], probs=c(0.025, 0.50, 0.975), na.rm=TRUE)
+
+```
+
+\newpage
+# Results 
+We report on `r ncaps` captures of `r ninds` indivudal Alabama beach mice from Spring 2004 to Spring 2017 (Table 2). For several Grid/Year/Season combinations, there were no recaptures and density estimates were either unreasonably high or could not be obtained (NaN in Table 3). 
+
+```{r Table2_raw_data_summary, echo=FALSE}
+kable(cf_summary, caption= "Summary of capture-mark-recapture data for the Alabamba beach mouse. Columns indicate the number of captures of individual mice from a single capture (1) up to eight recaptures (9 total captures) within each trapping session.", booktab=T) %>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  column_spec(column=1:11, width="1cm")
+
+```
+
+\newpage
+```{r Table3_results, echo=FALSE, results='asis'}
+kable(Ests, digits=2, align='l', longtable=TRUE, caption = 'Estimates of density (mice/ha), baseline capture probability (g0) and the decline in capture probability with distance (sigma) for each unique Grid/Year/Season combination.', linesep="", booktabs=T)  %>%
+  kable_styling(latex_options = c("hold_position")) %>%
+  kable_styling(font_size=10) %>%
+  column_spec(column=1, width="12em") %>%
+  column_spec(column=2:3, width="4em") %>% 
+  column_spec(column=4:6, width="8em") 
+    #add_header_above(c("Density"=2, "g0"=2, "sigma"=2))  #%>%
+    #add_footnote("Grid 1027PD_OLD in Spring 2012 and in Fall 2013, 37PD_OLD in Spring 2011, and 3PS_OLD in Fall 2012, and GazeboPostIvan_IJKLM in Spring 2004 had no recaptures and have been omitted.", notation="alphabet")
+
+```
+
+
+## References
+
