@@ -201,28 +201,28 @@ Different subsets of grids were operated during each year and season (Table 1). 
 
 ## Spatially-explicit capture mark recapture
 
-We used program *secr* [@efford2018] to estimate density (mice/hectare) for each unique Grid separately. We assumed that density varied by Year/Season (hereafter referred to as Session) within the same grid. 
+We used program `secr` [@efford2018] to estimate density (mice/hectare) separately for each trapping grid and session (year/season combination). Recaptures across sessions were too limited to model beach mice population dynamics (e.g., survival, extinction, etc.). 
 
-$$N \sim~ \mathrm{Poisson}(\mu\; \mathrm{x}\; A(S)) $$
+$$N \sim~ \mathrm{Poisson}(\mu\; \mathrm{x}\; A(S) $$
 
 $$ \textbf{s}_i \sim \mathrm{Uniform}(S) $$
 
-Here $\mu$ corresponds to density within the study area *S*, and *A(S)* corresponds to the area of the state space. Individual activity centers $\textbf{s}_i$ are uniformly distributed within the state space *S*.
+Here $\mu$ corresponds to density within the trapping grid *S* (i.e., the state space), and *A(S)* corresponds to the area of the state space. Individual activity centers $\textbf{s}_i$ are uniformly distributed within *S*.
 
-In *secr*, the user can define the width of a buffer around the trapping grids to restrict the area of integration within which the unknown activity centers are numerically integrated out of the likelihood. The buffer should be large enough that the bias in estimated densities is small. For grids with variable sampling effort (e.g., false sets) the default buffer checks are not allowed. For these grids, we used the *esa.plot* function to visually inspect the relationship between estimated density and increasing buffer width. We chose a buffer width at which the estimated density no longer decreased.
+In `secr`, the user defines the width of a buffer around the trapping locations to restrict the area of integration within which the unknown activity centers are numerically integrated out of the likelihood. The buffer should be large enough that the bias in estimated densities is small. For grids with variable sampling effort (e.g., false sets) the default buffer checks are not allowed. For these grids, we used the `esa.plot` function to visually inspect the relationship between estimated density and increasing buffer width. We chose a buffer width at which the estimated density no longer decreased.
 
-We specified a half-normal detection function, where $g_0$ is the baseline capture probability and $\sigma$ determines how quickly capture probability declines as the distance between an animal's activity center *i* and a trap *j* increases. In our analysis, we allowed $g_0$ and $\sigma$ to be shared among Sessions for grids that were sampled multiple times.
+We specified a half-normal detection function, where $g_0$ is the baseline capture probability at an individual mouse's activity center and $\sigma$ determines how quickly capture probability declines as the distance between an animal's activity center *i* and a trap *j* increases. In our analysis, we estimated $g_0$ and $\sigma$ to be constant among trapping grids and sessions within one of three larger study areas: Fort Morgan, Perdue Dunes, and Perdue Scrub.
 
 $$ p_{ij} = g_0exp(-d^2_{ij}/(2\sigma^2))$$
-Our capture histories (y=1 if individual *i* was captured in trap *j*, on occasion *k* and 0 otherwise) were then modelled as coming from a Bernoulli distribution, where capture probability *p* did not vary over time:
+Our capture histories (y = 1 if individual *i* was captured in trap *j*, on occasion *k* and 0 otherwise) were then modelled as coming from a Bernoulli distribution, where capture probability *p* did not vary over time:
 
-$$ y_{i,j,k} \sim~ \mathrm{Bernoulli}(p_{i,j})$$
+$$ y_{ijk} \sim~ \mathrm{Bernoulli}(p_{ij})$$
 
-On some occasions, traps were occupied by non-target species or were found closed, but with no animal inside (e.g., false set). For trapping grids where false-sets occurred, we coded these captures as a zero and supplied a usage matrix to our capture history data. Some animals were captured, but then removed from the study area for a translocation project or died after their tag number was recorded. For these animals, we recorded a negative value for their capture history, on the occasion they were removed from the population.   
+Note that this analysis may be too simplistic. While we generate density estimates for each grid/session separately, we constrain *g0* and *sigma* to be constant among grids within a larger study area. Thus, any potential differences in *g0* or *sigma* among grids or years or age/sex classes are ignored, as is any potential learned response to traps over time. 
 
-Each trap station consisted of two side-by-side traps, so catching multiple mice within the same trap station on the same occasion was not uncommon. Mice also may forage together and so on some occasions, multiple mice may even be found within the same trap. Therefore we specified the detector type 'multi' to allow for these situations where multiple individuals could be found in the same trap on a single occasion. 
+Each trap station consisted of two side-by-side traps, so catching multiple mice within the same trap station on the same occasion was not uncommon. Mice also may forage together and so on some occasions, multiple mice may even be found within the same trap. Therefore we specified the detector type 'multi' to allow for these situations where multiple individuals could be found in the same trap on a single occasion. There were some instances where mice were captured in two different traps within the same grid on the same trapping occasion. This is possible because traps were checked multiple times per occasion (early years) or because a mouse entered another trap after release but before all traps were closed for the occasion. For these individuals, we allowed `secr` to randomly select a single trap location within an occasion (*Note: we could also select the initial capture only*). 
 
-There were some instances where mice were captured in two different traps within the same grid on the same trapping occasion. This is possible because traps were checked multiple times per occassion. For these individuals, we allowed *secr* to randomly select a single trap location within an occasion. (OR MODEL AS CAMERA TRAP "PROXIMITY" TYPE?)
+On some occasions, both traps at a station were occupied by non-target species or were found closed, but with no animal inside (e.g., false sets). We removed these false sets from consideration by modifying the usage (effort) matrix to the capture history data. Lastly, some animals were removed from the study area after capture, either for a translocation project or occasionally due to death. These removals are indicated in the capture history with a negative value on the occasion an animal was removed from the population.   
 
 ```{r process_captures, include=FALSE}
 # Load capture data data
@@ -281,18 +281,18 @@ kable(effort_tab, caption = "Summary of when grids were operational (1) or not (
 \el
 
 ```{r SCR_data_summary, include=FALSE}
-# Format capture history with each row as a mouse
-abm_ch <- with(abm, table(Mouse, Trap, Date))
+# Summarize capture history with each row as a mouse
+ch_summary <- with(abm, table(Mouse, Trap, Date))
 
 # Number of captures 
-(ncaps <- sum(abm_ch))
+(ncaps <- sum(ch_summary))
 
 # Number of unique individuals
 # Assumes mice with same ID in different Sessions are different individuals
 (ninds <- select(abm, Session, Mouse) %>% unique() %>% nrow())
 
 #capture frequencies
-table(rowSums(abm_ch))
+table(rowSums(ch_summary))
 #   1   2   3   4   5   6   7   8   9  10  11  12 
 # 587 343 269 173 111  60  32  24   6   5   4   1 
 
@@ -300,7 +300,7 @@ table(rowSums(abm_ch))
 cf_summary <- abm %>% count(Session, Mouse) %>%
   count(Session, n) %>%
   spread(n, nn, fill = 0) %>%
-  janitor::adorn_totals(c("row", "col"))
+  adorn_totals(c("row", "col"))
 ```
 
 ```{r format_caps_secr, include=FALSE}
@@ -326,7 +326,9 @@ sg_traps <- sg_traps[names(sg_caps)]
 # Format via secr
 traps <- lapply(sg_traps, function(i) {
   tmp <- select(i, Detector = Trap, x = UTME, y = UTMN) %>%
-    distinct() %>% as.data.frame()
+    distinct() %>% 
+    arrange(Detector) %>%
+    as.data.frame()
   rownames(tmp) <- tmp$Detector
   read.traps(data = tmp, detector="multi")
 })
@@ -336,6 +338,21 @@ trap_avail <- lapply(sg_traps, function(i) {
   # Drop false sets
   tmp <- filter(i, !Unavailable)
   with(tmp, table(Trap, Date))
+})
+
+# Create masks for each session
+# Defaults are likely overkill and slow the fitting process
+# Here we shoot for just over 2000 grid points for the mask considering a 150 m buffer
+# SECR documentation suggests 1000 is typically adequate
+
+masks <- lapply(traps, function(t, ncells = 2000, buffer = 150) {
+  sum_t <- summary(t)
+  xr <- diff(sum_t$xrange) + buffer * 2
+  yr <- diff(sum_t$yrange) + buffer * 2
+  l2w <- xr/yr
+  nr <- ceiling(sqrt(ncells/l2w))
+  nc <- ceiling(nr * l2w)
+  msk <- make.mask(t, buffer = buffer, nx = nc, ny = nr)
 })
 ```
 
@@ -354,16 +371,77 @@ abm_ch <- lapply(names(sg_caps), function(sg) {
 names(abm_ch) <- names(sg_caps)
 ```
 
-```{r fit simple models in secr, include=FALSE, eval=FALSE}
-#Buffer should be wide enough not to cause bias in estimated densities
-#Secr includes a buffer bias check when fitting models that shows a warning if the predicted relative bias exceeds 0.01
-#Checked detection probability vs. buffer width for grids where the bias check failed (b/c of variable effort matrix)
+```{r secr_fits, include=FALSE, eval=FALSE}
+## Buffer should be wide enough not to cause bias in estimated densities
+## Secr includes a buffer bias check when fitting models that shows a warning if the predicted relative bias exceeds 0.01
+## Checked detection probability vs. buffer width for grids where the bias check failed (b/c of variable effort matrix)
+## NOTE: by not defining an explicit mask, it's possible that density estimates include non-suitable habitat. This may 
+## especially be the case for older trapping "grids" that are quite spread out and linear...
 
-# Traps belong to a larger study area
-# Fort Morgan (FT or FTM), Perdue Scrub (PS), and Perdue Dunes (PD, Gazeo, MobileStW)
+## Trap grids are defined to belong to one of three larger study areas:
+## Fort Morgan (FT or FTM), Perdue Scrub (PS), and Perdue Dunes (PD, Gazebo, MobileStW)
 
-## Analysis - Analyze each Grid separately, with Session (Year/Season) as the Session
+## Analysis - Generate estimates for each grid/session separately, but estimate g0 and sigma at the study area level
+## and as a constant across animals, occasions, and detectors
+## Thus, any potential differences in g0 (e.g., capture probability at an individual's range center) or
+## sigma (scale parameter of an individual's range) among grids within a study area are ignored, as is any 
+## potential learned response to traps, or possibly age, sex, or yearly differences in these core parameters... 
+
 ## Grids without any captures not included in analysis
+
+# Retrieve number of cores for processing
+ncores <- max(1, parallel::detectCores()/2 - 2)
+
+## Fort Morgan
+fm <- grep("fm|ftm", names(abm_ch), ignore.case = TRUE)
+fm_ch <- MS.capthist(abm_ch[fm])
+fm_masks <- masks[fm]
+
+# Produce a pdf of trapping plots
+pdf("./Output/FM_trapping_plots.pdf")
+for (f in seq_along(fm_ch)) {
+  plot(traps(fm_ch[[f]]), border = 10, bty = 'o') # base plot
+  plot(fm_ch[[f]], title = paste("Trapping summary:", names(fm_ch)[f]), tracks = TRUE, add = TRUE)
+}
+dev.off()
+
+fm_fit <- secr.fit(fm_ch, model = list(D ~ session, g0 ~ 1, sigma ~ 1), 
+                   mask = fm_masks, buffer = 150, 
+                   start = list(D = 0.001, g0 = 0.1, sigma = 100), ncores = ncores)
+
+## Perdue Dunes
+pd <- grep("pd|perduedune|gazebo|mobilest", names(abm_ch), ignore.case = TRUE)
+pd_ch <- MS.capthist(abm_ch[pd])
+pd_masks <- masks[pd]
+
+# Produce a pdf of trapping plots
+pdf("./Output/PD_trapping_plots.pdf")
+for (p in seq_along(pd_ch)) {
+  plot(traps(pd_ch[[p]]), border = 10, bty = 'o') # base plot
+  plot(pd_ch[[p]], title = paste("Trapping summary:", names(pd_ch)[p]), tracks = TRUE, add = TRUE)
+}
+dev.off()
+
+pd_fit <- secr.fit(pd_ch, model = list(D ~ session, g0 ~ 1, sigma ~ 1), 
+                   mask = pd_masks, buffer = 150, 
+                   start = list(D = 0.001, g0 = 0.1, sigma = 100), ncores = ncores)
+
+## Perdue Scrub
+ps <- grep("ps|perduescrub", names(abm_ch), ignore.case = TRUE)
+ps_ch <- MS.capthist(abm_ch[ps])
+ps_masks <- masks[ps]
+
+# Produce a pdf of trapping plots
+pdf("./Output/PS_trapping_plots.pdf")
+for (p in seq_along(ps_ch)) {
+  plot(traps(ps_ch[[p]]), border = 10, bty = 'o') # base plot
+  plot(ps_ch[[p]], title = paste("Trapping summary:", names(ps_ch)[p]), tracks = TRUE, add = TRUE)
+}
+dev.off()
+
+ps_fit <- secr.fit(ps_ch, model = list(D ~ session, g0 ~ 1, sigma ~ 1), 
+                   mask = ps_masks, buffer = 150,
+                   start = list(D = 0.001, g0 = 0.1, sigma = 100), ncores = ncores)
 
 ## O&7FM_OLD
 O_7FM_OLD<-ch[[38]] # Only captures in one trapping session
